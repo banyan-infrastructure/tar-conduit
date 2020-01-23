@@ -143,6 +143,7 @@ instance Exception TarException
 
 data TarCreateException
     = FileNameTooLong   !FileInfo
+    | LinkNameTooLong   !ByteString !FileInfo
     | TarCreationError  !String
     deriving Show
 instance Exception TarCreateException

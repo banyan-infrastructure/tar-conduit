@@ -194,6 +194,24 @@ gnutarSpec = do
                            P.replicate 100 'o' Posix.</>
                            P.replicate 99 'b')
             }
+    it "LongLink - a symlink with a long link name but short file name" $ do
+        emptyFileInfoExpectation $
+            defFileInfo
+            { filePath =
+                  S8.pack (P.replicate 5 'f' Posix.</>
+                           P.replicate 8 'o' Posix.</>
+                           P.replicate 13 'b')
+            , fileType = FTSymbolicLink $ S8.pack $ P.replicate 1234 'f'
+            }
+    it "LongLink - a symlink with long file name and long link name" $ do
+        emptyFileInfoExpectation $
+            defFileInfo
+            { filePath =
+                  S8.pack (P.replicate 100 'f' Posix.</>
+                           P.replicate 100 'o' Posix.</>
+                           P.replicate 99 'b')
+            , fileType = FTSymbolicLink $ S8.pack $ P.replicate 1234 'f'
+            }
     it "LongLink - multiple files with long file names" $ do
         fileInfoExpectation
             [ ( defFileInfo
@@ -212,6 +230,25 @@ gnutarSpec = do
                 , fileSize = 11
                 }
               , "abcxdefghij")
+            ]
+    it "LongLink - multiple files with long file names and long link names" $ do
+        fileInfoExpectation
+            [ ( defFileInfo
+                { filePath =
+                      S8.pack (P.replicate 100 'f' Posix.</>
+                               P.replicate 100 'o' Posix.</>
+                               P.replicate 99 'b')
+                , fileType = FTSymbolicLink $ S8.pack $ P.replicate 999 'q'
+                }
+              , "")
+            , ( defFileInfo
+                { filePath =
+                      S8.pack (P.replicate 1000 'g' Posix.</>
+                               P.replicate 1000 'o' Posix.</>
+                               P.replicate 99 'b')
+                , fileType = FTSymbolicLink $ S8.pack $ P.replicate 877 'z'
+                }
+              , "")
             ]
     it "Large User Id" $ do emptyFileInfoExpectation $ defFileInfo {fileUserId = 0o777777777}
     it "All Large Numeric Values" $ do

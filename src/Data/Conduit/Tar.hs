@@ -311,6 +311,7 @@ withEntries = peekForever . withEntry
 -- * and only some portions of GNU format:
 --   * Larger values for `fileUserId`, `fileGroupId`, `fileSize` and `fileModTime`.
 --   * 'L' type - long file names, but only up to 4096 chars to prevent DoS attack
+--   * 'K' type - long link name, limit to 4096 as above
 --   * other types are simply discarded
 --
 -- /Note/ - Here is a really good reference for specifics of different tar formats:
@@ -322,54 +323,56 @@ withFileInfo :: MonadThrow m
              -> ConduitM TarChunk o m ()
 withFileInfo inner = start
   where
-    start = await >>= maybe (return ()) go
-    go x =
+    start = await >>= maybe (return ()) (go noChecking)
+    go check x =
         case x of
             ChunkHeader h
                 | headerLinkIndicator h >= 55 ->
                     if headerMagicVersion h == gnuTarMagicVersion
-                        then handleGnuTarHeader h >>= maybe start go
+                        then do
+                             (nextCheck, nextHeader) <- handleGnuTarHeader check h
+                             maybe start (go nextCheck) nextHeader
                         else dropWhileC
                                  (\case
                                       ChunkPayload _ _ -> True
                                       _                -> False) >> start
             ChunkHeader h -> do
-                payloadsConduit .| (inner (fileInfoFromHeader h) <* sinkNull)
+                h' <- either throwM return (check h)
+                payloadsConduit .| (inner (fileInfoFromHeader h') <* sinkNull)
                 start
             ChunkPayload offset _bs -> do
                 leftover x
                 throwM $ UnexpectedPayload offset
             ChunkException e -> throwM e
 
+    noChecking = Right
 
 -- | Take care of custom GNU tar format.
 handleGnuTarHeader :: MonadThrow m
-                   => Header
-                   -> ConduitM TarChunk o m (Maybe TarChunk)
-handleGnuTarHeader h =
+                   => (Header -> Either TarException Header)
+                   -> Header
+                   -> ConduitM TarChunk o m (Header -> Either TarException Header, Maybe TarChunk)
+handleGnuTarHeader performCheck h =
     case headerLinkIndicator h of
+        75 -> do
+            longFileNameBuilder <- readLongNameFromPayload 'K' h
+            let longLinkName = SL.toStrict . SL.init . toLazyByteString $ longFileNameBuilder
+            mcNext <- await
+            case mcNext of
+                Just (ChunkHeader nh) -> do
+                    return (transformLongLinkName longLinkName, Just $ ChunkHeader nh)
+                Just c@(ChunkPayload offset _) -> do
+                    leftover c
+                    throwM $ InvalidHeader offset
+                Just (ChunkException exc) -> throwM exc
+                Nothing -> throwM NoMoreHeaders
         76 -> do
-            let pSize = headerPayloadSize h
-            -- guard against names that are too long in order to prevent a DoS attack on unbounded
-            -- file names
-            unless (0 < pSize && pSize <= 4096) $
-                throwM $
-                FileTypeError (headerPayloadOffset h) 'L' $ "Filepath is too long: " ++ show pSize
-            longFileNameBuilder <- payloadsConduit .| foldMapC byteString
+            longFileNameBuilder <- readLongNameFromPayload 'L' h
             let longFileName = SL.toStrict . SL.init . toLazyByteString $ longFileNameBuilder
             mcNext <- await
             case mcNext of
                 Just (ChunkHeader nh) -> do
-                    unless (S.isPrefixOf (fromShort (headerFileNameSuffix nh)) longFileName) $
-                        throwM $
-                        FileTypeError (headerPayloadOffset nh) 'L'
-                        "Long filename doesn't match the original."
-                    return
-                        (Just $ ChunkHeader $
-                         nh
-                         { headerFileNameSuffix = toShort longFileName
-                         , headerFileNamePrefix = SS.empty
-                         })
+                    return (checkFileNameMatches longFileName, Just $ ChunkHeader nh)
                 Just c@(ChunkPayload offset _) -> do
                     leftover c
                     throwM $ InvalidHeader offset
@@ -378,9 +381,33 @@ handleGnuTarHeader h =
         83 -> do
             payloadsConduit .| sinkNull -- discard sparse files payload
             -- TODO : Implement restoring of sparse files
-            return Nothing
-        _ -> return Nothing
+            return (performCheck, Nothing)
+        _ -> return (performCheck, Nothing)
 
+  where
+    checkFileNameMatches longFileName h' = do
+      h'' <- performCheck h'
+      if S.isPrefixOf (fromShort (headerFileNameSuffix h'')) longFileName
+         then return $
+                  h'' { headerFileNameSuffix = toShort longFileName
+                      , headerFileNamePrefix = SS.empty
+                      }
+         else Left $ FileTypeError (headerPayloadOffset h') 'L'
+              "Long filename doesn't match the original."
+
+    transformLongLinkName longLinkName h' = do
+      h'' <- performCheck h'
+      return $ h'' { headerLinkName = toShort longLinkName }
+
+
+    readLongNameFromPayload kind h' = do
+        let pSize = headerPayloadSize h'
+        -- guard against names that are too long in order to prevent a DoS attack on unbounded
+        -- file names
+        unless (0 < pSize && pSize <= 4096) $
+            throwM $
+            FileTypeError (headerPayloadOffset h') kind $ "Filepath is too long: " ++ show pSize
+        payloadsConduit .| foldMapC byteString
 
 
 -- | Just like `withFileInfo`, but works directly on the stream of bytes.
@@ -472,38 +499,51 @@ headerFromFileInfo offset fi = do
     if SS.length prefix > 155 || SS.null suffix
         then return $ Left $ FileNameTooLong fi
         else do
-            (payloadSize, linkName, linkIndicator) <-
-                case fileType fi of
-                    FTNormal -> return (fileSize fi, SS.empty, 48)
-                    FTHardLink ln -> return (0, toShort ln, 49)
-                    FTSymbolicLink ln -> return (0, toShort ln, 50)
-                    FTDirectory -> return (0, SS.empty, 53)
-                    fty ->
-                        throwM $
-                        TarCreationError $
-                        "<headerFromFileInfo>: Unsupported file type: " ++
-                        show fty ++ " for file: " ++ getFileInfoPath fi
-            return $
-                Right
-                    Header
-                    { headerOffset = offset
-                    , headerPayloadOffset = offset + 512
-                    , headerFileNameSuffix = suffix
-                    , headerFileMode = fileMode fi
-                    , headerOwnerId = fileUserId fi
-                    , headerGroupId = fileGroupId fi
-                    , headerPayloadSize = payloadSize
-                    , headerTime = fileModTime fi
-                    , headerLinkIndicator = linkIndicator
-                    , headerLinkName = linkName
-                    , headerMagicVersion = ustarMagicVersion
-                    , headerOwnerName = toShort $ fileUserName fi
-                    , headerGroupName = toShort $ fileGroupName fi
-                    , headerDeviceMajor = 0
-                    , headerDeviceMinor = 0
-                    , headerFileNamePrefix = prefix
-                    }
+            let outHeader =
+                  Header
+                      { headerOffset = offset
+                      , headerPayloadOffset = offset + 512
+                      , headerFileNameSuffix = suffix
+                      , headerFileMode = fileMode fi
+                      , headerOwnerId = fileUserId fi
+                      , headerGroupId = fileGroupId fi
+                      , headerPayloadSize = fileSize fi
+                      , headerTime = fileModTime fi
+                      , headerLinkIndicator = 48
+                      , headerLinkName = SS.empty
+                      , headerMagicVersion = ustarMagicVersion
+                      , headerOwnerName = toShort $ fileUserName fi
+                      , headerGroupName = toShort $ fileGroupName fi
+                      , headerDeviceMajor = 0
+                      , headerDeviceMinor = 0
+                      , headerFileNamePrefix = prefix
+                      }
 
+            case fileType fi of
+                 FTNormal -> return $ Right $ outHeader
+                 FTHardLink ln -> return $ handleLinkName outHeader 49 ln
+                 FTSymbolicLink ln -> return $ handleLinkName outHeader 50 ln
+                 FTDirectory ->
+                   return $ Right $
+                     outHeader
+                         { headerLinkIndicator = 53
+                         , headerPayloadSize = 0 }
+                 fty ->
+                     throwM $
+                     TarCreationError $
+                     "<headerFromFileInfo>: Unsupported file type: " ++
+                     show fty ++ " for file: " ++ getFileInfoPath fi
+
+  where
+    handleLinkName outHeader kind ln =
+      let sln = toShort ln in
+      if SS.length sln <= 100
+         then Right $
+              outHeader
+                  { headerLinkIndicator = kind
+                  , headerLinkName = toShort $ S8.take 100 ln
+                  , headerPayloadSize = 0 }
+         else Left $ LinkNameTooLong ln fi
 
 -- | Split a file path at the @n@ mark from the end, while still keeping the
 -- split as a valid path, i.e split at a path separator only.
@@ -737,11 +777,11 @@ tarFileInfo offset = do
             0 -> 0
             x -> blockSize - x
 
-    produceGNUHeaderAndAdjust fPath kind offset' fi = do
+    produceGNUHeaderAndAdjust transformFileInfo fPath kind offset' fi = do
         let fPathLen = fromIntegral (S.length fPath + 1)
             pad = computePad fPathLen
             nextOffset = offset' + blockSize + fPathLen + pad
-            fi' = fi {filePath = S.take 100 fPath}
+            fi' = transformFileInfo fi
         pFileNameHeader <-
             packHeader $
                 (defHeader offset')
@@ -758,12 +798,30 @@ tarFileInfo offset = do
     emitSpecialHeaderFromFileInfo offset' fi = do
         eHeader <- headerFromFileInfo offset' fi
         case eHeader of
+            Left (LinkNameTooLong lPath _) -> do
+                -- kind 75 -- 'K' -- for long link target
+                (fi', nextOffset) <-
+                    produceGNUHeaderAndAdjust
+                        (\fi' -> fi' {fileType = mapLinkName (S8.take 100) (fileType fi')})
+                        lPath 75 offset' fi
+                emitSpecialHeaderFromFileInfo nextOffset fi'
             Left (FileNameTooLong _) -> do
+                let fPath = filePath fi
                 -- kind 76 -- 'L' -- for long file name
-                (fi', nextOffset) <- produceGNUHeaderAndAdjust (filePath fi) 76 offset' fi
+                (fi', nextOffset) <-
+                    produceGNUHeaderAndAdjust
+                        (\fi' -> fi' {filePath = S.take 100 fPath})
+                        fPath 76 offset' fi
                 emitSpecialHeaderFromFileInfo nextOffset fi'
             Left exc -> throwM exc
             Right header -> return (header, offset')
+
+    mapLinkName f fty =
+        case fty of
+            FTSymbolicLink l -> FTSymbolicLink (f l)
+            FTHardLink l -> FTHardLink (f l)
+            _ -> fty
+
 
 -- | Create a tar archive by suppying a stream of `Left` `FileInfo`s. Whenever a
 -- file type is `FTNormal`, it must be immediately followed by its content as
