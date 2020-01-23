@@ -130,8 +130,7 @@ instance Arbitrary GnuTarFile where
         fileGroupNameLen <- (`mod` 32) <$> arbitrary
         fileGroupName <- asciiGen fileGroupNameLen
         fileMode <- fromIntegral <$> choose (0o000 :: Word, 0o777)
-        -- TODO: use `filePathLen` instead, once long link name 'K' is implemented
-        linkNameLen <- (`mod` 101) <$> arbitrary
+        linkNameLen <- (`mod` 4090) <$> arbitrary
         fileType <-
             oneof
                 [ pure FTNormal
