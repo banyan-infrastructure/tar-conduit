@@ -726,41 +726,44 @@ tarFileInfo offset = do
             throwM $
                 TarCreationError "<tarFileInfo>: Received payload without a corresponding FileInfo."
         Just (Left fi) -> do
-            eHeader <- headerFromFileInfo offset fi
-            case eHeader of
-                Left (FileNameTooLong _) -> do
-                    let fPath = filePath fi
-                        fPathLen = fromIntegral (S.length fPath + 1)
-                        pad =
-                            case fPathLen `mod` blockSize of
-                                0 -> 0
-                                x -> blockSize - x
-                    eHeader' <-
-                        headerFromFileInfo
-                            (offset + blockSize + fPathLen + pad)
-                            (fi {filePath = S.take 100 fPath})
-                    header <- either throwM return eHeader'
-                    pHeader <- packHeader header
-                    pFileNameHeader <-
-                        packHeader $
-                        (defHeader offset)
-                        { headerFileNameSuffix = "././@LongLink"
-                        , headerPayloadSize = fPathLen
-                        , headerLinkIndicator = 76 -- 'L'
-                        , headerMagicVersion = gnuTarMagicVersion
-                        }
-                    yield pFileNameHeader
-                    yield fPath
-                    yield $ S.replicate (fromIntegral pad + 1) 0
-                    yield pHeader
-                    tarPayload 0 header tarFileInfo
-                Left exc -> throwM exc
-                Right header -> do
-                    packHeader header >>= yield
-                    tarPayload 0 header tarFileInfo
+            (header, _) <- emitSpecialHeaderFromFileInfo offset fi
+            packHeader header >>= yield
+            tarPayload 0 header tarFileInfo
         Nothing -> return offset
 
+  where
+    computePad fPathLen =
+        case fPathLen `mod` blockSize of
+            0 -> 0
+            x -> blockSize - x
 
+    produceGNUHeaderAndAdjust fPath kind offset' fi = do
+        let fPathLen = fromIntegral (S.length fPath + 1)
+            pad = computePad fPathLen
+            nextOffset = offset' + blockSize + fPathLen + pad
+            fi' = fi {filePath = S.take 100 fPath}
+        pFileNameHeader <-
+            packHeader $
+                (defHeader offset')
+                { headerFileNameSuffix = "././@LongLink"
+                , headerPayloadSize = fPathLen
+                , headerLinkIndicator = kind
+                , headerMagicVersion = gnuTarMagicVersion
+                }
+        yield pFileNameHeader
+        yield fPath
+        yield $ S.replicate (fromIntegral pad + 1) 0
+        return (fi', nextOffset)
+
+    emitSpecialHeaderFromFileInfo offset' fi = do
+        eHeader <- headerFromFileInfo offset' fi
+        case eHeader of
+            Left (FileNameTooLong _) -> do
+                -- kind 76 -- 'L' -- for long file name
+                (fi', nextOffset) <- produceGNUHeaderAndAdjust (filePath fi) 76 offset' fi
+                emitSpecialHeaderFromFileInfo nextOffset fi'
+            Left exc -> throwM exc
+            Right header -> return (header, offset')
 
 -- | Create a tar archive by suppying a stream of `Left` `FileInfo`s. Whenever a
 -- file type is `FTNormal`, it must be immediately followed by its content as
